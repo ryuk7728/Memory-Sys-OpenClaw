@@ -27,6 +27,17 @@ Below, `OCI:` means the installed package, `OCU:` means upstream `main`, and `AR
 
 **Version mismatch.** The installed 2026.7.1-2 is about four months and roughly 20 releases behind upstream. Several behaviours this design depends on changed in between: defaults, storage format, backends, and config paths. Section 2.8 lists them. Unless a statement says "upstream", it refers to **the installed version**.
 
+**Revision 2 (after review, 2026-11-09).** The architecture is unchanged. What changed:
+- the rollout order: restore FTS, then **upgrade before any custom code**;
+- raw transcript indexing now sits behind an explicit safety gate;
+- call-transcript storage is now an opt-in privacy feature with a retention policy;
+- the voice-bridge is treated as a maintained component, not a 100-line script;
+- the embedder is chosen only after an on-host benchmark;
+- the voice brief is smaller and tightly scoped;
+- the 97 s consult is instrumented before any timeout changes.
+
+The affected sections are §1, §5, §7–§13.
+
 **Environment limitation.** `ai.google.dev` and `developers.openai.com` were blocked by my research sandbox's network policy. Gemini and OpenAI embedding prices and quotas are therefore marked **[Unverified]**; check them before spending money.
 
 ---
@@ -36,13 +47,13 @@ Below, `OCI:` means the installed package, `OCU:` means upstream `main`, and `AR
 1. **Don't merge voice into the Telegram session (design A).** OpenClaw runs at most one turn per session key, so voice consults would queue behind Telegram turns. The installed `openclaw agent` CLI can also return `status: "in_flight"`, and an outbound call Ari places from Telegram can deadlock against its own blocked turn ([§4](#4-architecture-comparison-designs-ad)).
 2. **Adopt design C+:** a fresh OpenClaw session per call, plus a shared memory plane that both channels read and write. Telegram stays its own rolling session.
 3. **Memory search is effectively off today.** The memory provider is explicitly set to OpenAI, and the installed version fails closed when an explicit remote provider errors. `memory_search` therefore returns "unavailable" instead of falling back to keyword search, and the index holds 0 chunks ([§2.4](#24-memory-search-and-embeddings-installed-version)). Fixing this is step one.
-4. **Use embeddings that run on the Ubuntu host,** via the official llama.cpp provider (`provider: "local"`, EmbeddingGemma 300M, about 0.6 GB). The installed docs say this provider falls back to keyword search when embedding fails. The corpus is tiny, so CPU is enough, and nothing leaves the host. Gemini embeddings are a reasonable later upgrade, but only with a separate paid-tier credential, never AgentRing's voice key.
+4. **Keyword search (FTS) is the floor; local embeddings are the preferred upgrade, decided by benchmark.** Benchmark the official llama.cpp provider (`provider: "local"`, EmbeddingGemma 300M, about 0.6 GB) on this host: index time, query p95, RAM, cold start, and recall gain over FTS. The installed docs say this provider falls back to keyword search when embedding fails, and nothing leaves the host. Gemini embeddings are a later option, but only with a separate paid-tier credential, never AgentRing's voice key.
 5. **Markdown files are the source of truth.** `MEMORY.md` holds curated durable facts, `memory/YYYY-MM-DD.md` holds episodic notes, and a new `memory/calls/` folder holds one summary per call. These give citations (`Source: path#line`), simple deletion and correction, and grep-ability. Raw transcripts are an archive, not memory.
-6. **Most personal-context questions on a call should not need a ~97 s OpenClaw consult.** Inject a precomputed "voice brief" at call start. The AgentRing library officially supports per-call `instructions` as a function of the call. Keep `consult_agent` for slow tasks. AgentRing already returns a "working on it" note after 20 s and delivers the late answer afterwards.
-7. **AgentRing doesn't persist inbound call transcripts.** It keeps them in memory, and its logs record only a turn count. A small "voice bridge" wrapper, using AgentRing's documented library API in place of `agentring serve --ai`, is the cleanest way to capture each call, summarise it into `memory/calls/`, and log whether each consult completed.
-8. **For cross-session recall,** widen `tools.sessions.visibility` from `tree` to `agent` and index sessions (`memorySearch.sources: ["memory","sessions"]` with `experimental.sessionMemory: true`). Do this only while `main` stays a DM-only, single-user agent, and route any group or other-user work to a separate agent.
-9. **Before any upgrade, pin every security-relevant default explicitly.** Upstream later changed the omitted `tools.sessions.visibility` from `tree` to `agent` (2026.8.2) and then to `all` (2026.9.2). It also removed QMD (2026.8.1), moved transcripts to SQLite (2026.8.1), and moved `agents.defaults.memorySearch` to `memory.search`.
-10. **Experiments are still required** (see [§12](#12-test-plan)). The open questions are: whether OpenClaw's memory flush ever fires before Codex's native compaction, where the 97 s consult time goes, and how `in_flight` and steering behave when a CLI turn targets a busy session.
+6. **Most personal-context questions on a call should not need a ~97 s OpenClaw consult.** Inject a small precomputed "voice brief" (800–1,200 tokens, timestamped, tightly scoped) at call start. The AgentRing library officially supports per-call `instructions` as a function of the call. Keep `consult_agent` for slow tasks. AgentRing already returns a "working on it" note after 20 s and delivers the late answer afterwards.
+7. **AgentRing doesn't persist inbound call transcripts.** It keeps them in memory, and its logs record only a turn count. A "voice bridge" built on AgentRing's documented library API, in place of `agentring serve --ai`, can summarise each call into `memory/calls/` and log whether each consult completed. Treat it as a **maintained component** (several hundred lines with tests), not a script. Raw transcript capture is **opt-in, `0600`, preferably encrypted, and short-retention**; summaries outlive raw transcripts.
+8. **Bridge channels with curated notes first.** Use daily notes, call summaries, and an inbox you confirm. Raw transcript retrieval (`sources: ["memory","sessions"]` plus `visibility: "agent"`) is the largest leakage risk. It is **deferred behind a gate**: `main` must provably receive no group or other-user traffic, and transcripts must be reviewed for credentials and sensitive data.
+9. **Upgrade OpenClaw before building custom components,** after restoring FTS on the installed version. First pin every security-relevant default explicitly, then rehearse a snapshot rollback. Upstream later changed the omitted `tools.sessions.visibility` from `tree` to `agent` (2026.8.2) and then to `all` (2026.9.2). It also removed QMD (2026.8.1), moved transcripts to SQLite (2026.8.1), and moved `agents.defaults.memorySearch` to `memory.search`.
+10. **Measure before tuning, and treat timeouts as backstops, not fixes.** Instrument the 97 s consult first. Experiments are still required (see [§12](#12-test-plan)). The open questions are: whether OpenClaw's memory flush ever fires before Codex's native compaction, where the 97 s consult time goes, and how `in_flight` and steering behave when a CLI turn targets a busy session.
 
 ---
 
@@ -136,7 +147,7 @@ The upstream OpenClaw recipe uses `--session-id "agentring-${AGENTRING_CALL_ID}"
 | Option | Relevant capability | Stores | Cross-session | Capture | Privacy / deps | Status | Fit |
 |---|---|---|---|---|---|---|---|
 | **memory-core (builtin)** | Hybrid BM25 + vector over `MEMORY.md` and `memory/*.md`, optionally session transcripts; citations | Markdown (truth) + SQLite index | Yes, through files; transcripts need `sessions` + visibility | Explicit writes and memory flush | Fully local with `local`/`none` | Default, bundled; upstream says builtin is now the only engine | **Core of the design** |
-| **Session memory** (`experimental.sessionMemory`) | Semantic recall over transcripts | Transcript chunks | Governed by `tools.sessions.visibility` | Automatic, async, may be stale | Transcripts can contain secrets | Experimental in 7.1 and upstream | Phase 3, after visibility is guarded |
+| **Session memory** (`experimental.sessionMemory`) | Semantic recall over transcripts | Transcript chunks | Governed by `tools.sessions.visibility` | Automatic, async, may be stale | Transcripts can contain secrets | Experimental in 7.1 and upstream | Phase 6, only after the §10 gate |
 | **Active Memory plugin** | Blocking recall sub-agent before replies (`timeoutMs` example 15000; docs suggest 3000-5000 for `message` mode) | Nothing new | Yes | Automatic recall | Extra model call per turn | Bundled | Telegram only; **does not run** on the CLI path AgentRing uses |
 | **QMD** | BM25 / vector / reranked query, local GGUF models (embeddinggemma ~300 MB, reranker ~640 MB, query expansion ~1.1 GB per [tobi/qmd README](https://github.com/tobi/qmd)) | Separate index | `memory.qmd.sessions.enabled` | Exports | Local | **Retired upstream** in 2026.8.1 | Avoid |
 | **Honcho** (`@honcho-ai/openclaw-honcho`) | Persists every turn to a service and builds user and agent models; `honcho_search_messages`, `honcho_ask` | Raw messages, derived conclusions, user models | Yes, across channels | Automatic | External service (managed, or self-hosted with an LLM); AGPL-3.0 server ([plastic-labs/honcho](https://github.com/plastic-labs/honcho), pushed 2026-11-06) | Official doc page | Strong concept, but adds a service and LLM dependency and an opaque derived model |
@@ -222,15 +233,47 @@ Where each kind of state belongs:
 3. **Memory plane.** Markdown files are authoritative. The builtin index is derived and can be rebuilt (`openclaw memory index --force --agent main`).
 4. **Embedder.** `@openclaw/llama-cpp-provider` with EmbeddingGemma 300M, running locally. If it fails, recall continues as keyword-only (FTS), per the docs.
 5. **Memory curator.** An OpenClaw cron job, which runs a fresh session per run ([OCI: concepts/session.md](https://cdn.jsdelivr.net/npm/openclaw@2026.7.1-2/docs/concepts/session.md)), every few hours plus nightly. It:
-   - reads recent Telegram history via `sessions_history` (needs `visibility: "agent"`) and recent `memory/calls/*`;
+   - reads `memory/YYYY-MM-DD.md` (written by the Telegram session itself, per the agent instructions) and recent `memory/calls/*`. Reading Telegram history directly with `sessions_history` needs `visibility: "agent"` and waits for the §10 gate;
    - appends episodic notes;
    - *proposes* durable facts. It doesn't silently rewrite `MEMORY.md`: it writes a `memory/inbox.md` list that Pranay confirms from Telegram;
-   - regenerates `voice/brief.md` (at most ~1,500 tokens; no secrets, financial figures, credentials or IDs).
-6. **voice-bridge.** About 100 lines of Python using AgentRing's documented library API: `VoiceAgent`, `Consultations`, `load_agents`, `accept_incoming`, `run_ws`. It:
+   - regenerates `voice/brief.md` according to §5.3, only when the inputs have changed meaningfully.
+6. **voice-bridge.** A maintained Python component using AgentRing's documented library API: `VoiceAgent`, `Consultations`, `load_agents`, `accept_incoming`, `run_ws`. The happy path is about 100 lines. Expect several hundred with the requirements in §5.1, and pin the AgentRing version it is tested against. It:
    - builds instructions per call from the brief, so personal questions need no consult;
    - logs consult start and end and the outcome, which proves completion;
-   - after each call, writes the `CallResult` transcript to a `0600` spool file and runs one `openclaw agent --session-id agentring-<call>` turn: "summarise this call into `memory/calls/<date>-<call>.md` with provenance". It then deletes the raw spool after a retention window.
+   - after each call, if transcript capture is enabled (§5.2), writes the `CallResult` transcript to the spool and runs one `openclaw agent --session-id agentring-<call>` turn: "summarise this call into `memory/calls/<date>-<call>.md` with provenance". If capture is off, it summarises only the consult questions and answers already in the call's OpenClaw session.
    - **No-code fallback:** keep `agentring serve --ai --instructions @<static file>`, and have the curator also restart the service when the brief changes. Static instructions are read only at startup ([AR: voice/quick.py](https://github.com/mutonby/agentring/blob/1f81178830070ad0b3d48e7f9c9be3ef32f59812/daemon/src/agentring/voice/quick.py)). This loses inbound transcript capture.
+
+### 5.1 voice-bridge engineering requirements
+
+| Concern | Requirement |
+|---|---|
+| Cancellation | Hang-up cancels the pending speech, but **not** in-flight consults. Late answers follow AgentRing's existing "deliver as message" path. A consult still running at shutdown is killed after a grace period and logged as `abandoned`. |
+| Late answers | Record each consult's terminal state (`answered`, `failed`, `timeout`, `abandoned`) with its duration. Never mark a consult answered from model speech. |
+| Retries | No automatic retry of consults (they can have side effects). Retry only the post-call summary step, which is idempotent: keyed by call ID, it skips if the summary file exists. |
+| Atomic writes | Write to a temp file, `fsync`, then `rename` for summaries and the brief. Never leave a half-written Markdown file to be indexed. |
+| Shutdown | On SIGTERM, refuse new calls, let the active call finish up to a bound, flush pending summaries, then exit. Restarts must never drop an active call (restarts triggered by brief regeneration are gated on "no active call"). |
+| Logging | Structured logs containing call ID, consult ID, timings and outcome only. **No transcript text in logs**, matching AgentRing's own policy. |
+| Upgrades | Pin the `agentring` version; run a contract test (incoming-call accept, consult, `CallResult` shape) before any bump. |
+| Tests | Unit tests for policy and file handling; one end-to-end test with AgentRing's echo / local provider where available; a manual call checklist (§12). |
+
+### 5.2 Call-transcript retention policy (privacy feature)
+
+Calls can contain other people's voices and sensitive material, so raw capture is governed by an explicit policy:
+
+- **Off by default.** A config switch turns it on. When off, only consult questions and answers (already in OpenClaw) are summarised.
+- **Storage.** A dedicated spool directory with mode `0700` and files `0600`, owned by the service user. Preferably encrypted at rest: an encrypted home or volume, or per-file encryption with a key outside the workspace. Never inside the OpenClaw workspace, so it is never indexed by memory search.
+- **Retention.** Short and fixed, for example 72 hours or at most 7 days. A daily timer deletes files past retention. Deletion is logged by call ID only.
+- **Summaries outlive transcripts.** A summary records `raw_transcript: deleted <date>` in its front matter, so provenance stays honest.
+- **Third parties.** Summaries describe what Pranay said and decided. Other people's statements are reduced to what is needed (for example "spoke with the plumber; appointment Thursday").
+- **Manual purge.** A single command deletes the spool and, optionally, a given call's summary, followed by a reindex.
+
+### 5.3 Voice brief scope
+
+- **Size:** 800–1,200 tokens. Keep it small so the instructions stay focused and cheap.
+- **Header:** `Generated: <ISO timestamp>; sources: MEMORY.md@<mtime>, memory/<files>`.
+- **Includes:** how to address Pranay, language and style, current routines and near-term plans, open threads from the last few days, and standing preferences needed for ordinary conversation.
+- **Excludes:** credentials, tokens and IDs; financial amounts and account details; health and legal details; third parties' private data; anything not needed for ordinary conversation. For any of these, the voice model must use `consult_agent`.
+- **Regeneration:** when the inputs change meaningfully (new confirmed fact, new call summary, new day's episodic note), not on a blind interval. Add a daily floor so the timestamp never goes stale.
 
 ### Trust boundaries
 
@@ -361,7 +404,7 @@ flowchart LR
 
 **[Rec]**
 1. **Now:** set `provider: "none"` and reindex. This restores keyword recall within minutes and removes the fail-closed outage.
-2. **Next:** move to `provider: "local"` (llama.cpp) and reindex. It degrades to keyword search on failure, so it is the only semantic option in 7.1 that is resilient by design.
+2. **Next (after the upgrade):** benchmark `provider: "local"` (llama.cpp EmbeddingGemma) on this host: full index time, query p50/p95 warm and cold, resident RAM, cold start after idle, and recall gain over the FTS baseline on the §12 question set. The latency column above is **[Inferred]** until measured. Adopt it if recall improves within budget. It degrades to keyword search on failure, which makes it the preferred semantic option. Otherwise FTS-only is an acceptable end state.
 3. **Optional later:** Gemini, with a dedicated paid-tier key, only if recall tests show local quality is insufficient. Test whether `fallback: "local"` behaves as hoped before relying on it, because explicit remote providers fail closed.
 
 **Latency budget for realtime voice:**
@@ -385,18 +428,26 @@ Embedding choice barely matters for latency because search runs inside a consult
 | **Transcript archive** | OpenClaw | JSONL (7.1) / SQLite (8.1+) | `openclaw sessions cleanup`; pruned after 30 days by default (§2.7) |
 | **Embeddings** | memory-core | Derived; never authoritative | Rebuild at any time |
 | **Keyword fallback** | memory-core FTS5 | Always on | — |
-| **Voice brief** | Curator | Derived, sanitised, ≤1,500 tokens, with a "generated at" line | Regenerated; never edited by hand |
+| **Voice brief** | Curator | Derived, sanitised, 800–1,200 tokens, timestamped header, scoped per §5.3 | Regenerated; never edited by hand |
 
 Rules:
 - **Never auto-promote** facts extracted from voice into `MEMORY.md`. Speech-to-text errors and model paraphrase are the main source of wrong memories.
-- **Raw call transcripts** stay in a `0600` spool for at most 7 days (my suggestion), then only the summary remains.
+- **Raw call transcripts** are opt-in, follow §5.2, and are never stored in the indexed workspace. Only the summary remains after retention.
 - The **agent instructions** (in `AGENTS.md` / `SOUL.md` in the workspace) should require citing `Source:` paths when answering from memory and saying "I don't have that" instead of guessing.
 
 ---
 
 ## 9. Latency design
 
-1. **Find where the 97 s goes first (experiment).** Candidates, all **[Inferred]**:
+1. **Instrument the 97 s before changing any timeout.** A cap hides the problem; fixing the cause removes it. Record each component separately:
+   - CLI process start until the request is sent;
+   - transport (`meta.transport` gateway versus `embedded` fallback, from `--json`);
+   - gateway queue wait;
+   - model time, split into reasoning and output;
+   - each tool call's duration, especially `memory_search` failures and retries;
+   - process exit.
+
+   Candidate causes, all **[Inferred]**:
    - CLI cold start and plugin preload for each `openclaw agent` process;
    - an embedded fallback after a gateway failure (`--json` shows `meta.transport: "embedded"`);
    - Codex turn latency with reasoning;
@@ -405,7 +456,7 @@ Rules:
    Measure with `time openclaw agent --agent main --session-id probe-$(date +%s) --message "What city do I live in?" --json`, then repeat with `--thinking low`.
 2. **Acknowledgement.** Keep AgentRing's `before_tools` prompt (filler before tools).
 3. **Streaming status.** AgentRing's 20 s "working on it" note already exists, so don't lower it below about 10 s. Optionally add a 45 s "still checking" note in the voice-bridge.
-4. **Timeouts.** Set `timeout_s: 120` in `agents.yaml` and pass `--timeout 110` to `openclaw agent`, so OpenClaw stops first and the result is clean. Wrap the command in `timeout -k 10 115` as the docs advise for external wrappers.
+4. **Timeouts (after instrumentation, as a backstop).** Set `timeout_s: 120` in `agents.yaml` and pass `--timeout 110` to `openclaw agent`, so OpenClaw stops first and the result is clean. Wrap the command in `timeout -k 10 115` as the docs advise for external wrappers.
 5. **Cancellation.** If the user hangs up, AgentRing still delivers the late answer as a phone message (inbound, untargeted calls). Keep that behaviour, because it is the "partial results" path.
 6. **Retries.** Don't auto-retry consults (side effects). Retry only on `in_flight` (which shouldn't happen with per-call sessions).
 7. **Caching.** The voice brief *is* the cache. Regenerate it every 2-4 hours and after notable Telegram activity.
@@ -417,9 +468,9 @@ Rules:
 
 | Setting (7.1) | Exact semantics (docs) | Recommendation |
 |---|---|---|
-| `agents.defaults.memorySearch.experimental.sessionMemory` | Opt-in transcript indexing; async; may be stale | `true` in phase 3 |
-| `agents.defaults.memorySearch.sources: ["memory","sessions"]` | Adds transcripts to `memory_search` | Phase 3 |
-| `tools.sessions.visibility: "agent"` | Session tools and transcript hits may reach **any session of agent `main`**, including other users' if per-sender sessions exist under it | Set it, **with** the DM-only and single-user guard and a separate agent for anything else |
+| `agents.defaults.memorySearch.experimental.sessionMemory` (`memory.search…` after upgrade) | Opt-in transcript indexing; async; may be stale | **Deferred** (Phase 6 gate) |
+| `agents.defaults.memorySearch.sources: ["memory","sessions"]` | Adds transcripts to `memory_search` | **Deferred** (Phase 6 gate) |
+| `tools.sessions.visibility: "agent"` | Session tools and transcript hits may reach **any session of agent `main`**, including other users' if per-sender sessions exist under it | Keep explicit `"tree"` until the gate passes |
 | `memory.qmd.sessions.enabled` | Exports transcripts into QMD (QMD backend only) | Don't use (QMD retired upstream) |
 
 **Leak paths if this is done carelessly:**
@@ -436,6 +487,13 @@ Rules:
 - a sanitised voice brief;
 - excluding secrets from memory files. Transcript search excerpts preserve credentials, per upstream [session-search.md](https://github.com/openclaw/openclaw/blob/94714fdce8e6bd96546b5440be41fa5297d65a95/docs/concepts/session-search.md).
 
+**Gate checklist before enabling raw transcript retrieval (all must pass):**
+1. `openclaw sessions --all-agents --json` shows agent `main` holding only Pranay's Telegram DM, its own `explicit:agentring-*` sessions, and cron sessions; no group, channel or other-peer keys.
+2. The config proves it stays that way: DM allowlist / pairing for Telegram, no bindings that route groups or other peers to `main`, and any group or shared use bound to a different agent with its own workspace.
+3. `openclaw security audit` is clean.
+4. A credential and sensitive-data sweep of `main`'s transcripts. Grep for key and token patterns, pairing codes and financial details. Handle any hits by deleting or compacting those sessions, or by not enabling.
+5. Curated notes and call summaries have been in use for at least two weeks, and the recall tests show a concrete gap that only transcripts would fill.
+
 **Upgrade warning:** set `tools.sessions.visibility` and `tools.agentToAgent.enabled` **explicitly** before upgrading past 2026.9.2. Otherwise an omitted value becomes `all` with agent-to-agent access on.
 
 **Canonical user ID:** for a single user, the agent *is* the user boundary, so merging channels into one session is unnecessary. Retrieval is unified through the memory plane instead. `identityLinks` safely unifies *DM routing* for linked channel peers only, and is not needed here.
@@ -444,50 +502,65 @@ Rules:
 
 ## 11. Migration plan
 
-All steps are **[Rec]**. Do them in order and validate between phases.
+All steps are **[Rec]**. Revision 2 changes the order: restore keyword recall on the installed version, **then upgrade OpenClaw**, and only then build custom components. Building the curator and voice-bridge on 2026.7 would have to be redone, because config paths, transcript storage, QMD and visibility defaults all change after 2026.7 (§2.8). Validate between phases. Each phase has its own rollback.
 
-**Phase 0: backup (no behaviour change).**
-1. Stop nothing yet. Snapshot to a local, encrypted location, never off the tailnet:
+**Phase 0: backup and baseline (no behaviour change).**
+1. Snapshot to a local, encrypted location, never off the tailnet:
    - `~/.openclaw/` (config, workspace, agents/sessions);
    - `~/.agentring/` (`agents.yaml`, `.env`, pairing state; keep `0600`);
-   - the AgentRing relay and LiveKit Docker volumes, using `docker compose` volume backup or a tar of named volumes. **Don't recreate the containers.**
+   - the AgentRing relay and LiveKit Docker volumes (tar of named volumes). **Don't recreate the containers.**
 2. Record the current state:
    - `openclaw --version`;
    - `openclaw memory status --deep --agent main`;
    - `openclaw sessions --json`, to note the Telegram session key and ID;
+   - the effective `session` and `tools.sessions` config;
    - `systemctl --user status` for the AgentRing unit.
-3. Pairing and service state: don't run `agentring init` or `agentring pair` again, and don't touch Firebase or the device tokens.
+3. Don't run `agentring init` or `agentring pair` again, and don't touch Firebase or device tokens.
+4. **Instrument the consult before changing anything** (§9.1). Record a baseline p50/p95 and its breakdown.
 
-**Phase 1: restore recall (minutes).**
+**Phase 1: restore recall on 2026.7.1-2 (minutes).**
 1. Set `agents.defaults.memorySearch.provider: "none"`.
 2. Run `openclaw memory index --force --agent main`, then `openclaw memory status --deep --agent main`. Expect about 20 files and more than 0 chunks, in FTS-only mode.
-3. Validate with 10 known-answer questions in Telegram (§12.1).
-4. Rollback: restore `openclaw.json` from the backup and restart the gateway.
+3. Run the recall baseline (§12, test 1) to get the FTS-only score.
+4. Rollback: restore `openclaw.json` and restart the gateway.
 
-**Phase 2: local semantic search.**
-1. Run `openclaw plugins install @openclaw/llama-cpp-provider`, then set `provider: "local"` and reindex.
-2. Re-run the recall test, then repeat it with the embedder stopped to prove the keyword fallback works.
+**Phase 2: upgrade OpenClaw, with tested rollback.**
+1. Before upgrading, pin every security-relevant default **explicitly** in config:
+   - `tools.sessions.visibility: "tree"` (keep today's behaviour; widen later only through the Phase 6 gate);
+   - `tools.agentToAgent.enabled: false`;
+   - `session.dmScope` and `session.reset` (the upstream reset default changed from daily to none).
+2. Read the 2026.8.1, 2026.8.2 and 2026.9.2 release notes, plus the notes for the target version.
+3. **Rehearse the rollback first:** restore the Phase 0 snapshot onto a scratch copy and confirm the old binary starts on it. Upstream warns that newer database formats are not readable by older binaries ([OCU: concepts/session.md §Creators and assigned owners](https://github.com/openclaw/openclaw/blob/94714fdce8e6bd96546b5440be41fa5297d65a95/docs/concepts/session.md)), so rollback means restoring the snapshot, not downgrading in place.
+4. Stop the gateway and run the upgrade. Then run `openclaw doctor --fix`, which migrates `memorySearch` → `memory.search` and JSONL / `sessions.json` → SQLite. Validate with `openclaw doctor --session-sqlite inspect --session-sqlite-all-agents`.
+5. Re-check that visibility, agent-to-agent, DM scope and reset are still explicit. Run `openclaw security audit`.
+6. Re-run Phase 1's recall baseline and an AgentRing smoke test (`agentring agents ask openclaw "…"`, then one real call). Tests 1, 7 and 12 in §12 must pass.
+7. Rollback: stop the gateway, restore the Phase 0 snapshot, reinstall `openclaw@2026.7.1-2`, and start it.
 
-**Phase 3: cross-session memory.**
-1. Pin `tools.sessions.visibility: "agent"` and `tools.agentToAgent.enabled: false` (single agent).
-2. Set `experimental.sessionMemory: true` and `sources: ["memory","sessions"]`.
-3. Set `session.reset` explicitly.
-4. Run `openclaw security audit`.
+**Phase 3: benchmark, then choose the embedder.**
+1. Install `@openclaw/llama-cpp-provider`, and **benchmark before switching**:
+   - full index time;
+   - query p50/p95 (warm and cold);
+   - resident RAM;
+   - cold start after an idle period;
+   - recall score against the FTS-only baseline.
+2. Switch only if recall improves meaningfully and query p95 stays well inside the consult budget. Otherwise stay on FTS-only, which is a legitimate end state for a corpus this size.
+3. Prove the degradation path: stop the embedder and confirm that keyword hits still come back.
+4. Rollback: `provider: "none"`, then reindex.
 
-**Phase 4: curator and brief.**
-1. Create the cron job, `memory/calls/`, `memory/inbox.md`, and `voice/brief.md`.
-2. Add the provenance and citation rules to the agent instructions.
+**Phase 4: curated bridge between channels.**
+1. Create `memory/calls/`, `memory/inbox.md` and `voice/brief.md` (§8).
+2. Add the curator cron job. Under `visibility: "tree"` it can't read the Telegram session. So in this phase the curator works from memory files only, and the Telegram session writes its own episodic notes, as required by the agent instructions.
+3. Add the provenance, citation and "don't guess" rules to `AGENTS.md`.
+4. Start the voice brief through the no-code path: a static `--instructions @file` plus a service restart when the brief changes. Gate the restart so it never interrupts an active call.
 
-**Phase 5: voice-bridge.**
-1. Install it as a new user unit next to the existing one, disabled.
-2. Switch over by stopping `agentring serve --ai` and starting the bridge. Rollback is the reverse two commands; `agents.yaml` and pairing are unchanged.
-3. Change `agents.yaml` to `timeout_s: 120`, with `--timeout 110` on the `openclaw agent` command.
+**Phase 5: voice-bridge (maintained component).**
+1. Build it to the requirements in §5.1, with tests. Install it as a separate user unit, disabled.
+2. Enable call-transcript capture only under the policy in §5.2, with its own on/off switch.
+3. Switch over by stopping `agentring serve --ai` and starting the bridge. Rollback is the reverse; `agents.yaml` and pairing are unchanged.
+4. Set consult timeouts from the Phase 0 measurements (§9), not before.
 
-**Phase 6 (separate change): upgrade OpenClaw.**
-1. Read the release notes for 2026.8.1, 2026.8.2 and 2026.9.2.
-2. Stop the gateway and back up.
-3. Run `openclaw doctor --fix`. This migrates `memorySearch` → `memory.search` and JSONL → SQLite.
-4. Verify that visibility stayed explicit, then re-run the full test plan.
+**Phase 6 (gated, optional): raw transcript retrieval.**
+Enable `sources: ["memory","sessions"]` and session-memory indexing, and widen `tools.sessions.visibility` to `"agent"`, **only if every item in the §10 gate checklist passes.** Rollback: return visibility to `"tree"`, remove `"sessions"` from `sources`, and reindex.
 
 ---
 
@@ -506,6 +579,10 @@ All steps are **[Rec]**. Do them in order and validate between phases.
 | 9 | **Latency** | 20 calls: time to greeting, time to a brief-answerable reply, consult p50 / p95 | Greeting ≤1.5 s; brief answer ≤3 s; no silence over 3 s; consult p95 under 60 s after the §9 fixes |
 | 10 | **Consult proof** | Check AgentRing / bridge logs for `answered` / `failed` per consult | 100% of consults have a terminal log line |
 | 11 | **Leakage** | Add a test group to a *separate* agent; check from `main` | `main` can't see the group session; the brief has no financial or credential data |
+| 12 | **Upgrade and rollback** | Rehearse restoring the Phase 0 snapshot under the old binary; after the upgrade, re-run tests 1, 3, 6 and 10 | Rollback starts cleanly with history intact; post-upgrade scores ≥ pre-upgrade; visibility still explicit |
+| 13 | **Embedder benchmark** | Index time, query p50/p95 (warm, cold), RSS, cold start, recall versus FTS | Adopt local only if recall gain is meaningful and query p95 is small relative to the consult budget |
+| 14 | **Transcript retention** | Enable capture, make a test call, advance past retention | Spool files are `0600`, outside the workspace and unindexed, deleted on schedule; summary front matter records the deletion; nothing appears in logs |
+| 15 | **Brief scope** | Seed test facts in each excluded category; regenerate | None appear in the brief; size 800–1,200 tokens; timestamp is current |
 
 Experiments still needed: the 97 s breakdown (§9.1), memory-flush behaviour on the Codex harness (§2.3), steering versus `in_flight` for CLI turns into busy sessions (§2.5), QMD scope for `explicit:` sessions (only if QMD were chosen), and whether Gemini `fallback` works on failure.
 
@@ -513,14 +590,13 @@ Experiments still needed: the 97 s breakdown (§9.1), memory-flush behaviour on 
 
 ## 13. Final recommendation for this deployment
 
-**Keep Telegram and voice as separate OpenClaw sessions. Connect them through one local memory plane instead of one live session.** Concretely:
+**Keep Telegram and voice as separate OpenClaw sessions, and connect them through one memory plane built on OpenClaw's own Markdown memory.** In order:
 
-1. Today, switch memory search to FTS-only (`provider: "none"`) and reindex. Recall is currently broken by the fail-closed OpenAI provider.
-2. Then move to the local llama.cpp EmbeddingGemma provider.
-3. Keep AgentRing's per-call `--session-id`, cap consults at 120 s, and stop treating "I'm pulling it up" as success.
-4. Add a curator cron job that writes dated episodic notes, proposes durable facts for Pranay to confirm into `MEMORY.md`, and generates a sanitised voice brief.
-5. Replace `agentring serve --ai` with a small voice-bridge built on AgentRing's documented library. It injects the brief per call, records consult outcomes, and summarises every call into `memory/calls/`.
-6. Enable session-transcript search with `visibility: "agent"` only while `main` remains DM-only and single-user.
-7. Pin every changed default explicitly before upgrading OpenClaw past 2026.8.
+1. **Today, on 2026.7.1-2:** switch memory search to FTS-only (`provider: "none"`), reindex, and record a recall baseline. Instrument the 97 s consult.
+2. **Upgrade OpenClaw** with a rehearsed snapshot rollback, after pinning visibility, agent-to-agent, DM scope and reset explicitly.
+3. **Benchmark local EmbeddingGemma** on the host. Adopt it only if it beats FTS on recall within the latency budget. FTS remains the floor in every case.
+4. **Bridge the channels with curated memory, not raw transcripts:** dated episodic notes, a summary per call, an inbox of proposed facts that Pranay confirms into `MEMORY.md`, and a sanitised voice brief of 800–1,200 tokens.
+5. **Build the voice-bridge as a maintained component** (per-call brief, consult instrumentation, opt-in retention-limited transcript capture). Reserve `consult_agent` for deep or current work.
+6. **Enable raw transcript search** (`sessions` source plus `visibility: "agent"`) only after the §10 gate passes.
 
-Don't merge voice into the Telegram session, don't adopt QMD, and don't add an external memory service.
+Not now: a shared Telegram/voice session, QMD, Honcho, Mem0, Graphiti, or LanceDB. Revisit a wiki or graph layer only if facts, relationships and contradictions outgrow Markdown with an inbox.
